@@ -1,21 +1,21 @@
 --!strict
 --[[
 
-	ToolTracker monitors a player's Backpack and Character for Tool state changes.
-	It emits events for ToolAdded, ToolEquipped, ToolUnequipped, and ToolRemoved.
+	Monitors a player's Backpack and Character to provide a unified Tool state model.
 
-	The tracker treats a Tool's location as its state:
-		Backpack, Character, or Other.
-	
+	Guarantees consistent logical transitions (Added -> Equipped -> Unequipped -> Removed) 
+	based purely on physical parent changes. Tools entering from outside are treated 
+	as 'Added', and Tools leaving both tracked containers are treated as 'Removed'.
+
 --]]
 
 const ToolParentState = table.freeze({
-	Backpack  = 1,
-	Character = 2,
-	Other     = 3,
+	Backpack  = "Backpack"  :: "Backpack",
+	Character = "Character" :: "Character",
+	Other     = "Other"     :: "Other",
 })
 
-type ToolParentState = index<typeof(ToolParentState), keyof<typeof(ToolParentState)>>
+type ToolParentState = "Backpack" | "Character" | "Other"
 
 --[[
     ----------------------------------------------------------------------------
@@ -25,14 +25,14 @@ type ToolParentState = index<typeof(ToolParentState), keyof<typeof(ToolParentSta
 
 local function connectAndTrack(self: ToolTracker, signal: RBXScriptSignal, callback: (...any) -> ...any)
 	local conn = signal:Connect(callback)
-	table.insert(self._connections, conn)
+	table.insert(self._connList, conn)
 end
 
 local function clearConnections(self: ToolTracker)
-	for _, conn in self._connections do
+	for _, conn in self._connList do
 		conn:Disconnect()
 	end
-	table.clear(self._connections)
+	table.clear(self._connList)
 end
 
 --[[
@@ -91,9 +91,9 @@ local function onParentChanged(self: ToolTracker, tool: Instance)
 	if not tool:IsA("Tool") then
 		return
 	end
-	
+
 	-- tools not present in the state map are treated as originating from Other
-	local prevState = self._toolStateMap[tool] or ToolParentState.Other
+	local prevState = self._toolMap[tool] or ToolParentState.Other
 
 	local currState = if tool.Parent == self._backpack then ToolParentState.Backpack
 		elseif tool.Parent == self._character then ToolParentState.Character
@@ -107,7 +107,7 @@ local function onParentChanged(self: ToolTracker, tool: Instance)
 
 	-- only retain Tools currently inside a tracked container.
 	-- removing the entry makes a later re-entry start from Other again.
-	self._toolStateMap[tool] = if currState == ToolParentState.Other then nil else currState
+	self._toolMap[tool] = if currState == ToolParentState.Other then nil else currState
 end
 
 local function observeContainer(self: ToolTracker, container: Backpack | Model)
@@ -118,7 +118,7 @@ local function observeContainer(self: ToolTracker, container: Backpack | Model)
 	connectAndTrack(self, container.ChildRemoved, function(child: Instance)
 		onParentChanged(self, child)
 	end)
-	
+
 	-- process existing children so tracking starts in sync with the container
 	for _, child in container:GetChildren() do
 		onParentChanged(self, child)
@@ -135,14 +135,14 @@ end
 
 local function detachContainers(self: ToolTracker)
 	clearConnections(self)
-	
+
 	-- flush all tracked Tools through the normal exit transition before clearing state.
 	-- this guarantees listeners receive Unequipped/Removed events when
 	-- tracking is stopped or switched to another container pair.
-	for tool, state in self._toolStateMap do
+	for tool, state in self._toolMap do
 		onStateChanged(self, tool, state, ToolParentState.Other)
 	end
-	table.clear(self._toolStateMap)
+	table.clear(self._toolMap)
 
 	self._backpack = nil
 	self._character = nil
@@ -154,7 +154,7 @@ end
 	----------------------------------------------------------------------------
 --]]
 
-local ToolTracker = {}
+local ToolTracker = { ClassName = "ToolTracker" }
 ToolTracker.__index = ToolTracker
 
 export type ToolTracker = typeof(ToolTracker.new())
@@ -171,9 +171,8 @@ function ToolTracker.new()
 		_backpack  = nil :: Backpack?,
 		_character = nil :: Model?,
 
-		_toolStateMap = {} :: {[Tool]: ToolParentState},
-		_connections  = {} :: {RBXScriptConnection},
-		_destroyed    = false,
+		_toolMap  = {} :: {[Tool]: ToolParentState},
+		_connList = {} :: {RBXScriptConnection},
 
 		_toolAddedEvent = toolAddedEvent,
 		ToolAdded = toolAddedEvent.Event,
@@ -187,6 +186,8 @@ function ToolTracker.new()
 		_toolUnequippedEvent = toolUnequippedEvent,
 		ToolUnequipped = toolUnequippedEvent.Event,
 
+		_destroyed = false,
+
 	}, ToolTracker)
 
 	return self	
@@ -194,15 +195,15 @@ end
 
 function ToolTracker.Track(self: ToolTracker, backpack: Backpack, character: Model)
 	if self._destroyed then
-		error("ToolTracker:Track() cannot be called after Destroy()", 2)
+		error(`[{self.ClassName}] call attempt after destroyed`, 2)
 	end
 
 	if not backpack:IsA("Backpack") then
-		error(`expected Backpack, got {backpack.ClassName}`, 2)
+		error(`[{self.ClassName}] expected Backpack, got {backpack.ClassName}`, 2)
 	end
 
 	if not character:IsA("Model") then
-		error(`expected Model, got {character.ClassName}`, 2)
+		error(`[{self.ClassName}] expected Model, got {character.ClassName}`, 2)
 	end
 
 	if self._backpack == backpack and self._character == character then
@@ -210,21 +211,17 @@ function ToolTracker.Track(self: ToolTracker, backpack: Backpack, character: Mod
 		-- and emit duplicate Added/Equipped events.
 		return
 	end
-	
+
 	detachContainers(self)
 	attachContainers(self, backpack, character)
 end
 
 function ToolTracker.GetTools(self: ToolTracker): {Tool}
-	if self._destroyed then
-		error("ToolTracker:GetTools() cannot be called after Destroy()", 2)
-	end
-
 	local tools = {}
-	for tool in self._toolStateMap do
+	for tool in self._toolMap do
 		tools[#tools + 1] = tool
 	end
-	
+
 	return tools
 end
 
