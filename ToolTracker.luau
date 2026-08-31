@@ -3,22 +3,22 @@
 
 	Monitors a player's Backpack and Character to provide a unified Tool state model.
 
-	Guarantees consistent logical transitions (Added -> Equipped -> Unequipped -> Removed) 
-	based purely on physical parent changes. Tools entering from outside are treated 
+	Guarantees consistent logical transitions (Added -> Equipped -> Unequipped -> Removed)
+	based purely on physical parent changes. Tools entering from outside are treated
 	as 'Added', and Tools leaving both tracked containers are treated as 'Removed'.
 
 --]]
 
-const ToolParentState = table.freeze({
+const ParentState = table.freeze({
 	Backpack  = "Backpack"  :: "Backpack",
 	Character = "Character" :: "Character",
 	Other     = "Other"     :: "Other",
 })
 
-type ToolParentState = "Backpack" | "Character" | "Other"
+type ParentState = "Backpack" | "Character" | "Other"
 
 --[[
-    ----------------------------------------------------------------------------
+	----------------------------------------------------------------------------
 	-<[ HELPERS ]>--------------------------------------------------------------
 	----------------------------------------------------------------------------
 --]]
@@ -36,93 +36,72 @@ local function clearConnections(self: ToolTracker)
 end
 
 --[[
-    ----------------------------------------------------------------------------
+	----------------------------------------------------------------------------
 	-<[ PRIVATE ]>--------------------------------------------------------------
 	----------------------------------------------------------------------------
 --]]
 
-local function onStateChanged(self: ToolTracker, tool: Tool, prevState: ToolParentState, currState: ToolParentState)
-	--[[
-	    State Transition Table (Previous -> Current):
-	    States: Backpack (B), Character (C), Other (O)
-
-	    FROM BACKPACK (B)
-	        B -> B : None
-	        B -> C : Equip
-	        B -> O : Remove
-
-	    FROM CHARACTER (C)
-	        C -> B : Unequip
-	        C -> C : None
-	        C -> O : Unequip -> Remove
-
-	    FROM OTHER (O)
-	        O -> B : Add
-	        O -> C : Add -> Equip
-	        O -> O : None
-	--]]
-
-	if prevState == ToolParentState.Backpack then
-		if currState == ToolParentState.Character then
+local function onStateChanged(self: ToolTracker, tool: Tool, prevState: ParentState, currState: ParentState)
+	if prevState == ParentState.Backpack then
+		if currState == ParentState.Character then
 			self._toolEquippedEvent:Fire(tool)
-		elseif currState == ToolParentState.Other then
+		elseif currState == ParentState.Other then
 			self._toolRemovedEvent:Fire(tool)
 		end
 
-	elseif prevState == ToolParentState.Character then
-		if currState == ToolParentState.Backpack then
+	elseif prevState == ParentState.Character then
+		if currState == ParentState.Backpack then
 			self._toolUnequippedEvent:Fire(tool)
-		elseif currState == ToolParentState.Other then
+		elseif currState == ParentState.Other then
 			self._toolUnequippedEvent:Fire(tool)
 			self._toolRemovedEvent:Fire(tool)
 		end
 
-	elseif prevState == ToolParentState.Other then
-		if currState == ToolParentState.Backpack then
+	elseif prevState == ParentState.Other then
+		if currState == ParentState.Backpack then
 			self._toolAddedEvent:Fire(tool)
-		elseif currState == ToolParentState.Character then
+		elseif currState == ParentState.Character then
 			self._toolAddedEvent:Fire(tool)
 			self._toolEquippedEvent:Fire(tool)
 		end
 	end
 end
 
-local function onParentChanged(self: ToolTracker, tool: Instance)
+local function onParentChanged(self: ToolTracker, tool: Instance, parent: Instance?)
 	if not tool:IsA("Tool") then
 		return
 	end
 
 	-- tools not present in the state map are treated as originating from Other
-	local prevState = self._toolMap[tool] or ToolParentState.Other
+	local prevState = self._toolMap[tool] or ParentState.Other
+	local currState = if parent == self._backpack then ParentState.Backpack
+		elseif parent == self._character then ParentState.Character
+		else ParentState.Other
 
-	local currState = if tool.Parent == self._backpack then ToolParentState.Backpack
-		elseif tool.Parent == self._character then ToolParentState.Character
-		else ToolParentState.Other
-
-	if prevState == currState then
+	if currState == prevState then
 		return
 	end
 
-	onStateChanged(self, tool, prevState, currState)
+	-- only retain tools currently inside a tracked container
+	-- removing the entry makes a later re-entry start from Other again
+	self._toolMap[tool] = if currState == ParentState.Other then nil
+		else currState
 
-	-- only retain Tools currently inside a tracked container.
-	-- removing the entry makes a later re-entry start from Other again.
-	self._toolMap[tool] = if currState == ToolParentState.Other then nil else currState
+	onStateChanged(self, tool, prevState, currState)
 end
 
 local function observeContainer(self: ToolTracker, container: Backpack | Model)
 	connectAndTrack(self, container.ChildAdded, function(child: Instance)
-		onParentChanged(self, child)
+		onParentChanged(self, child, child.Parent)
 	end)
 
 	connectAndTrack(self, container.ChildRemoved, function(child: Instance)
-		onParentChanged(self, child)
+		onParentChanged(self, child, child.Parent)
 	end)
 
-	-- process existing children so tracking starts in sync with the container
 	for _, child in container:GetChildren() do
-		onParentChanged(self, child)
-	end	
+		onParentChanged(self, child, child.Parent)
+	end
 end
 
 local function attachContainers(self: ToolTracker, backpack: Backpack, character: Model)
@@ -130,26 +109,25 @@ local function attachContainers(self: ToolTracker, backpack: Backpack, character
 	self._character = character
 
 	observeContainer(self, backpack)
-	observeContainer(self, character)	
+	observeContainer(self, character)
 end
 
 local function detachContainers(self: ToolTracker)
 	clearConnections(self)
 
-	-- flush all tracked Tools through the normal exit transition before clearing state.
-	-- this guarantees listeners receive Unequipped/Removed events when
-	-- tracking is stopped or switched to another container pair.
-	for tool, state in self._toolMap do
-		onStateChanged(self, tool, state, ToolParentState.Other)
-	end
-	table.clear(self._toolMap)
-
 	self._backpack = nil
 	self._character = nil
+
+	-- flush all tracked tools through the exit transition
+	-- this guarantees listeners receive Unequipped/Removed events
+	for tool, state in self._toolMap do
+		onStateChanged(self, tool, state, ParentState.Other)
+	end
+	table.clear(self._toolMap)
 end
 
 --[[
-    ----------------------------------------------------------------------------
+	----------------------------------------------------------------------------
 	-<[ PUBLIC ]>---------------------------------------------------------------
 	----------------------------------------------------------------------------
 --]]
@@ -171,7 +149,7 @@ function ToolTracker.new()
 		_backpack  = nil :: Backpack?,
 		_character = nil :: Model?,
 
-		_toolMap  = {} :: {[Tool]: ToolParentState},
+		_toolMap  = {} :: {[Tool]: ParentState},
 		_connList = {} :: {RBXScriptConnection},
 
 		_toolAddedEvent = toolAddedEvent,
@@ -190,7 +168,7 @@ function ToolTracker.new()
 
 	}, ToolTracker)
 
-	return self	
+	return self
 end
 
 function ToolTracker.Track(self: ToolTracker, backpack: Backpack, character: Model)
@@ -216,10 +194,10 @@ function ToolTracker.Track(self: ToolTracker, backpack: Backpack, character: Mod
 	attachContainers(self, backpack, character)
 end
 
-function ToolTracker.GetTools(self: ToolTracker): {Tool}
+function ToolTracker.GetTools(self: ToolTracker)
 	local tools = {}
 	for tool in self._toolMap do
-		tools[#tools + 1] = tool
+		table.insert(tools, tool)
 	end
 
 	return tools
