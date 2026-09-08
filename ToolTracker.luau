@@ -104,26 +104,32 @@ local function observeContainer(self: ToolTracker, container: Backpack | Model)
 	end
 end
 
-local function attachContainers(self: ToolTracker, backpack: Backpack, character: Model)
-	self._backpack = backpack
+local function initialize(self: ToolTracker, backpack: Backpack, character: Model)
+	clearConnections(self)
+	self._backpack  = backpack
 	self._character = character
+
+	for tool in self._toolMap do
+		-- sync existing tools against
+		-- the new backpack and character
+		onParentChanged(self, tool, tool.Parent)
+	end
 
 	observeContainer(self, backpack)
 	observeContainer(self, character)
 end
 
-local function detachContainers(self: ToolTracker)
+local function teardown(self: ToolTracker)
 	clearConnections(self)
-
-	self._backpack = nil
+	self._backpack  = nil
 	self._character = nil
 
-	-- flush all tracked tools through the exit transition
-	-- this guarantees listeners receive Unequipped/Removed events
-	for tool, state in self._toolMap do
-		onStateChanged(self, tool, state, ParentState.Other)
-	end
 	table.clear(self._toolMap)
+
+	self._toolAddedEvent:Destroy()
+	self._toolRemovedEvent:Destroy()
+	self._toolEquippedEvent:Destroy()
+	self._toolUnequippedEvent:Destroy()
 end
 
 --[[
@@ -186,12 +192,11 @@ function ToolTracker.Track(self: ToolTracker, backpack: Backpack, character: Mod
 
 	if self._backpack == backpack and self._character == character then
 		-- re-tracking the same containers would reprocess their existing children
-		-- and emit duplicate Added/Equipped events.
+		-- and emit Added/Equipped events again for the same tools.
 		return
 	end
 
-	detachContainers(self)
-	attachContainers(self, backpack, character)
+	initialize(self, backpack, character)
 end
 
 function ToolTracker.GetTools(self: ToolTracker)
@@ -199,22 +204,14 @@ function ToolTracker.GetTools(self: ToolTracker)
 	for tool in self._toolMap do
 		table.insert(tools, tool)
 	end
-
 	return tools
 end
 
 function ToolTracker.Destroy(self: ToolTracker)
-	if self._destroyed then
-		return
+	if not self._destroyed then
+		self._destroyed = true
+		teardown(self)
 	end
-
-	self._destroyed = true
-	detachContainers(self)
-
-	self._toolAddedEvent:Destroy()
-	self._toolRemovedEvent:Destroy()
-	self._toolEquippedEvent:Destroy()
-	self._toolUnequippedEvent:Destroy()
 end
 
 return ToolTracker
